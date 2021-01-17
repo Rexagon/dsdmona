@@ -1,0 +1,12 @@
+[package]
+name = "dsdmona"
+version = "0.1.0"
+authors = ["Rexagon <reide740@gmail.com>"]
+edition = "2018"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"
+x11rb = "0.8.0"
