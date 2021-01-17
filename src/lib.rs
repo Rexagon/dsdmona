@@ -1,7 +1,8 @@
 mod desktop;
+mod path;
 mod user;
 
-use desktop::*;
+use desktop::{Desktop, Environment};
 
 pub struct LastSession {
     pub uid: i32,
@@ -9,8 +10,8 @@ pub struct LastSession {
     pub env: Environment,
 }
 
-pub fn select_desktop() -> Desktop {
-    let mut users = unsafe { user::all_users() };
+pub fn select_desktop() -> Option<Desktop> {
+    let mut users = unsafe { user::all_human_users() };
     for user in users {
         println!(
             "User: {}, {}, {}, {}",
@@ -21,12 +22,10 @@ pub fn select_desktop() -> Desktop {
         );
     }
 
-    // TODO
-    Desktop {
-        name: "".to_string(),
-        exec: "".to_string(),
-        env: Environment::Xorg,
-        is_user: false,
-        path: "".to_string(),
+    let desktops = desktop::all_desktops();
+    for desktop in desktops {
+        println!("{:?}", desktop);
     }
+
+    None
 }

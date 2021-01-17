@@ -8,6 +8,9 @@ use libc::group as c_group;
 use libc::passwd as c_passwd;
 use libc::{c_char, c_int, gid_t, uid_t};
 
+pub const MIN_UID: uid_t = 1000;
+pub const MAX_UID: uid_t = 65534;
+
 #[derive(Clone)]
 pub struct User {
     uid: uid_t,
@@ -189,6 +192,10 @@ where
 
 pub unsafe fn all_users() -> impl Iterator<Item = User> {
     AllUsers::new()
+}
+
+pub unsafe fn all_human_users() -> impl Iterator<Item = User> {
+    all_users().filter(|user| user.uid >= MIN_UID && user.uid < MAX_UID)
 }
 
 struct AllUsers;
