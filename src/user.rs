@@ -1,11 +1,12 @@
-use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use anyhow::{anyhow, Result};
 use libc::group as c_group;
 use libc::passwd as c_passwd;
+use libc::spwd as c_spwd;
 use libc::{c_char, c_int, gid_t, uid_t};
 
 pub const MIN_UID: uid_t = 1000;
@@ -18,7 +19,6 @@ pub struct User {
     name: Arc<OsStr>,
     home_dir: PathBuf,
     shell: PathBuf,
-    password: OsString,
 }
 
 impl User {
@@ -40,10 +40,6 @@ impl User {
 
     pub fn shell(&self) -> &Path {
         Path::new(&self.shell)
-    }
-
-    pub fn password(&self) -> &OsStr {
-        &self.password
     }
 }
 
@@ -68,6 +64,30 @@ impl Group {
     }
 }
 
+pub fn get_current() -> User {
+    unsafe { get_user_by_uid(libc::getuid()).unwrap() }
+}
+
+pub fn set_fs_user(user: &User) {
+    unsafe {
+        libc::setfsuid(user.uid);
+        libc::setgid(user.primary_group);
+    };
+}
+
+pub fn set_file_owner<T>(path: T, user: &User) -> Result<()>
+where
+    T: AsRef<Path>,
+{
+    let path = CString::new(path.as_ref().as_os_str().as_bytes())?;
+    let r = unsafe { libc::chown(path.as_ptr(), user.uid, user.primary_group) };
+    if r != 0 {
+        Err(anyhow!("Failed to chown file (errno: {})", r))
+    } else {
+        Ok(())
+    }
+}
+
 unsafe fn from_raw_buf<'a, T>(p: *const c_char) -> T
 where
     T: From<&'a OsStr>,
@@ -79,14 +99,12 @@ unsafe fn cpasswd_to_user(passwd: c_passwd) -> User {
     let name = from_raw_buf(passwd.pw_name);
     let home_dir = from_raw_buf::<OsString>(passwd.pw_dir).into();
     let shell = from_raw_buf::<OsString>(passwd.pw_shell).into();
-    let password = from_raw_buf::<OsString>(passwd.pw_passwd);
     User {
         uid: passwd.pw_uid,
         primary_group: passwd.pw_gid,
         name,
         home_dir,
         shell,
-        password,
     }
 }
 
@@ -114,7 +132,7 @@ unsafe fn get_group_members(groups: *mut *mut c_char) -> Vec<OsString> {
     members
 }
 
-unsafe fn get_user_by_uid(uid: uid_t) -> Option<User> {
+pub fn get_user_by_uid(uid: uid_t) -> Option<User> {
     let mut passwd = unsafe { std::mem::zeroed::<c_passwd>() };
     let mut buf = vec![0; 2048];
     let mut result = std::ptr::null_mut::<c_passwd>();
@@ -142,7 +160,81 @@ unsafe fn get_user_by_uid(uid: uid_t) -> Option<User> {
     Some(user)
 }
 
-unsafe fn get_group_by_gid(gid: gid_t) -> Option<Group> {
+pub fn get_user_password<T>(username: &T) -> Result<CString>
+where
+    T: AsRef<OsStr> + ?Sized,
+{
+    let username = CString::new(username.as_ref().as_bytes())?;
+
+    let mut spwd = unsafe { std::mem::zeroed::<c_spwd>() };
+    let mut buf = vec![0; 2048];
+    let mut result = std::ptr::null_mut::<c_spwd>();
+
+    loop {
+        let r = unsafe { libc::getspnam_r(username.as_ptr(), &mut spwd, buf.as_mut_ptr(), buf.len(), &mut result) };
+
+        match r {
+            libc::EACCES => {
+                return Err(anyhow!(
+                    "The caller does not have permission to access the shadow password file"
+                ))
+            }
+            libc::ERANGE => {
+                let newsize = buf
+                    .len()
+                    .checked_mul(2)
+                    .ok_or_else(|| anyhow!("Failed to increase spwd buffer"))?;
+                buf.resize(newsize, 0);
+            }
+            _ => break,
+        }
+    }
+
+    if result.is_null() || result != &mut spwd {
+        return Err(anyhow!("Failed to find shadow file record for specified username"));
+    }
+
+    let result = unsafe { CString::new(CStr::from_ptr(spwd.sp_pwdp).to_bytes())? };
+    Ok(result)
+}
+
+pub fn get_user_by_name<T>(username: &T) -> Option<User>
+where
+    T: AsRef<OsStr> + ?Sized,
+{
+    let username = match CString::new(username.as_ref().as_bytes()) {
+        Ok(username) => username,
+        Err(_) => return None,
+    };
+
+    let mut passwd = unsafe { std::mem::zeroed::<c_passwd>() };
+    let mut buf = vec![0; 2048];
+    let mut result = std::ptr::null_mut::<c_passwd>();
+
+    loop {
+        let r = unsafe { libc::getpwnam_r(username.as_ptr(), &mut passwd, buf.as_mut_ptr(), buf.len(), &mut result) };
+
+        if r != libc::ERANGE {
+            break;
+        }
+
+        let newsize = buf.len().checked_mul(2)?;
+        buf.resize(newsize, 0);
+    }
+
+    if result.is_null() {
+        return None;
+    }
+
+    if result != &mut passwd {
+        return None;
+    }
+
+    let user = unsafe { cpasswd_to_user(result.read()) };
+    Some(user)
+}
+
+fn get_group_by_gid(gid: gid_t) -> Option<Group> {
     let mut passwd = unsafe { std::mem::zeroed::<c_group>() };
     let mut buf = vec![0; 2048];
     let mut result = std::ptr::null_mut::<c_group>();
@@ -170,7 +262,7 @@ unsafe fn get_group_by_gid(gid: gid_t) -> Option<Group> {
     Some(group)
 }
 
-unsafe fn get_user_groups<T>(username: &T, gid: gid_t) -> Option<Vec<Group>>
+pub fn get_user_groups<T>(username: &T, gid: gid_t) -> Option<Vec<Group>>
 where
     T: AsRef<OsStr> + ?Sized,
 {

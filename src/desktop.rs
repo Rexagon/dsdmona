@@ -1,11 +1,17 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::str::FromStr;
 
 use anyhow::{anyhow, Result};
+use libc::uid_t;
 use walkdir::WalkDir;
 
-use crate::user::User;
+use crate::user::{self, User};
+
+const XORG_SESSIONS_PATH: &str = "/usr/share/xsessions";
+const LAST_SESSION_PATH: &str = "/.cache/dsdmona/last_session";
 
 #[derive(Debug, Clone)]
 pub struct Desktop {
@@ -19,6 +25,59 @@ pub fn all_desktops() -> Vec<Desktop> {
     Environment::Xorg.list_desktops()
 }
 
+pub fn get_last_desktop<'a>(user: &User, desktops: &'a [Desktop]) -> Option<&'a Desktop> {
+    let last_session = get_last_session(user)?;
+    desktops
+        .iter()
+        .find(|desktop| desktop.env == last_session.env && desktop.exec == last_session.exec)
+}
+
+pub struct LastSession {
+    pub uid: uid_t,
+    pub exec: String,
+    pub env: Environment,
+}
+
+pub fn get_last_session(user: &User) -> Option<LastSession> {
+    let path = user.home_dir().join(LAST_SESSION_PATH);
+    if !path.exists() {
+        return None;
+    }
+
+    let last_session = std::fs::read_to_string(path).ok()?;
+    let last_session = last_session.trim();
+
+    let split = last_session.find(';')?;
+    let (exec, env) = last_session.split_at(split);
+    let env = match Environment::from_str(env) {
+        Ok(env) => env,
+        Err(e) => {
+            eprintln!("Failed to parse last session: {}", e);
+            return None;
+        }
+    };
+
+    Some(LastSession {
+        uid: user.uid(),
+        exec: exec.to_owned(),
+        env,
+    })
+}
+
+pub fn set_last_session(usr: &User, desktop: &Desktop) -> Result<()> {
+    let previous_user = user::get_current();
+
+    user::set_fs_user(usr);
+
+    let path = usr.home_dir().join(LAST_SESSION_PATH);
+    std::fs::create_dir_all(&path)?;
+    std::fs::write(&path, format!("{};{}\n", desktop.exec, desktop.env));
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o744))?;
+
+    user::set_fs_user(&previous_user);
+    Ok(())
+}
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum Environment {
     Xorg,
@@ -27,7 +86,7 @@ pub enum Environment {
 impl Environment {
     pub fn list_desktops(&self) -> Vec<Desktop> {
         match self {
-            Environment::Xorg => WalkDir::new("/usr/share/xsessions")
+            Environment::Xorg => WalkDir::new(XORG_SESSIONS_PATH)
                 .into_iter()
                 .filter_map(|e| match e {
                     Ok(entry) if entry.file_type().is_file() => match entry.path().extension()?.to_str()? {
@@ -92,6 +151,25 @@ impl Environment {
 
                 Ok(desktop)
             }
+        }
+    }
+}
+
+impl std::fmt::Display for Environment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Environment::Xorg => f.write_str("Xorg"),
+        }
+    }
+}
+
+impl FromStr for Environment {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Xorg" | "xorg" => Ok(Environment::Xorg),
+            _ => Err(anyhow!("Unknown environment")),
         }
     }
 }

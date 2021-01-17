@@ -9,6 +9,7 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1.0"
+dialoguer = "0.7"
 libc = "0.2"
 walkdir = "2.3"
-x11rb = "0.8"
+x11 = { version = "2.18", features = ["xlib"] }
