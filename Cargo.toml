@@ -11,5 +11,6 @@ path = "src/lib.rs"
 anyhow = "1.0"
 dialoguer = "0.7"
 libc = "0.2"
+signal-hook = "0.3"
 walkdir = "2.3"
 x11 = { version = "2.18", features = ["xlib"] }

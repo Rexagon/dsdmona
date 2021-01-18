@@ -9,10 +9,14 @@ use std::ffi::{OsStr, OsString};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Password, Select};
+use signal_hook::consts::signal::*;
+use signal_hook::iterator::Signals;
 
 pub use self::config::{Config, LaunchType};
 use self::desktop::Desktop;
@@ -44,7 +48,7 @@ fn define_env(user: &User, desktop: &Desktop) -> Result<Env> {
     env.insert("PWD", user.home_dir().into());
     env.insert("USER", user.name().into());
     env.insert("LOGNAME", user.name().into());
-    env.insert("XDG_CONFIG_HOME", user.home_dir().join("/.config").into());
+    env.insert("XDG_CONFIG_HOME", user.home_dir().join(".config").into());
     env.insert("XDG_RUNTIME_DIR", runtime_dir.clone().into());
     env.insert("XDG_SEAT", "seat0".into());
     env.insert("XDG_SESSION_CLASS", "user".into());
@@ -145,7 +149,11 @@ fn xorg(user: User, desktop: Desktop, mut env: Env, config: Config) -> Result<()
     env.variables.insert("XAUTHORITY", xauthority.as_os_str().to_owned());
     env.variables.insert("DISPLAY", display.clone().into());
 
-    std::fs::remove_file(&xauthority);
+    std::env::set_var("XAUTHORITY", &xauthority);
+    std::env::set_var("DISPLAY", &display);
+
+    std::fs::write(&xauthority, "")?;
+    user::set_file_owner(&xauthority, &user)?;
 
     // Generate mcookie
     let output = exec_cmd("/usr/bin/mcookie", &user, &env).output()?;
@@ -154,15 +162,12 @@ fn xorg(user: User, desktop: Desktop, mut env: Env, config: Config) -> Result<()
     // Generate xauth
     let _output = exec_cmd("/usr/bin/xauth", &user, &env)
         .arg("add")
-        .arg("DISPLAY")
+        .arg(&display)
         .arg(".")
         .arg(mcookie.trim())
         .output()?;
 
-    println!("Generated XAuthority");
-
-    // Start X
-
+    // Start XOrg
     let mut xorg = Command::new("/usr/bin/Xorg")
         .arg(format!("vt{}", config.tty))
         .arg(&display)
@@ -174,26 +179,49 @@ fn xorg(user: User, desktop: Desktop, mut env: Env, config: Config) -> Result<()
         let display = XDisplay::open(display)?;
 
         // Start xinit
-        let xinit = prepare_gui_command(&user, &desktop, &env, &config)?.spawn()?;
+        let xinit = prepare_gui_command(&user, &desktop, &env, &config)?
+            .current_dir(user.home_dir())
+            .spawn()?;
         println!("Started XInit");
 
         Ok((display, xinit))
     };
-    let (xdisplay, mut xinit) = match start_xinit() {
+    let (_xdisplay, mut xinit) = match start_xinit() {
         Ok(r) => r,
         Err(e) => {
-            unsafe { libc::kill(xorg.id() as i32, libc::SIGINT) };
+            kill_process(xorg.id());
+            wait_process(xorg);
             return Err(e);
         }
     };
 
-    xinit.wait()?;
+    let mut signals = Signals::new(&[SIGHUP, SIGINT, SIGQUIT, SIGTERM]).unwrap();
+    let signals_handle = signals.handle();
+    std::thread::spawn({
+        let xinit_id = xinit.id();
+        move || {
+            for _ in signals.forever() {
+                kill_process(xinit_id);
+            }
+        }
+    });
+
+    loop {
+        let r = unsafe { libc::getpgid(xinit.id() as i32) };
+        if r < 0 {
+            break;
+        } else {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    wait_process(xinit);
     println!("XInit finished");
 
-    std::mem::drop(xdisplay);
+    signals_handle.close();
 
-    unsafe { libc::kill(xorg.id() as i32, libc::SIGINT) };
-    xorg.wait()?;
+    kill_process(xorg.id());
+    wait_process(xorg);
     println!("XOrg finished");
 
     // Remove auth
@@ -212,13 +240,13 @@ fn prepare_gui_command(user: &User, desktop: &Desktop, env: &Env, config: &Confi
     let exec: Vec<OsString> = if desktop.env == Environment::Xorg
         && config.launch_type == LaunchType::XInitRc
         && !exec.contains(&OsString::from(".xinitrc"))
-        && user.home_dir().join("/.xinitrc").exists()
+        && user.home_dir().join(".xinitrc").exists()
     {
-        let mut result = vec!["/bin/sh".into(), user.home_dir().join("/.xinitrc").into_os_string()];
+        let mut result = vec!["/bin/sh".into(), user.home_dir().join(".xinitrc").into_os_string()];
         result.extend(exec.into_iter());
         result
     } else if config.launch_type == LaunchType::DBus {
-        let mut result = vec!["dbus-launch ".into()];
+        let mut result = vec!["dbus-launch".into()];
         result.extend(exec.into_iter());
         result
     } else {
@@ -247,6 +275,16 @@ where
         command.env(key, value);
     }
     command
+}
+
+fn kill_process(pid: u32) {
+    unsafe { libc::kill(pid as i32, libc::SIGINT) };
+}
+
+fn wait_process(mut child: Child) {
+    if let Err(e) = child.wait() {
+        eprintln!("Failed to wait child process: {}", e);
+    }
 }
 
 fn get_free_xdisplay() -> Option<u32> {

@@ -11,7 +11,7 @@ use walkdir::WalkDir;
 use crate::user::{self, User};
 
 const XORG_SESSIONS_PATH: &str = "/usr/share/xsessions";
-const LAST_SESSION_PATH: &str = "/.cache/dsdmona/last_session";
+const LAST_SESSION_PATH: &str = ".cache/dsdmona/last_session";
 
 #[derive(Debug, Clone)]
 pub struct Desktop {
