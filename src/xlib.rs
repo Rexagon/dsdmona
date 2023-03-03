@@ -12,7 +12,7 @@ impl XDisplay {
     pub fn open(name: String) -> Result<Self> {
         let display_name = CString::new(name)?;
 
-        for i in 0..50 {
+        for _ in 0..50 {
             let display = unsafe { xlib::XOpenDisplay(display_name.as_ptr()) };
             if !display.is_null() {
                 return Ok(Self { display });

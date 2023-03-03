@@ -1,7 +1,6 @@
 use std::ffi::{CStr, CString, OsStr};
 
-use libc::utmpx as c_utmpx;
-use libc::{c_char, pid_t};
+use libc::c_char;
 
 use crate::user;
 
@@ -30,28 +29,4 @@ where
         }
         user_password.as_ref() == CStr::from_ptr(result)
     }
-}
-
-fn prepare_utml_entry(username: &str, pid: pid_t, tty_no: &str) -> c_utmpx {
-    let mut utmpx = unsafe { std::mem::zeroed::<c_utmpx>() };
-
-    let dev_name = unsafe { CStr::from_ptr(libc::ttyname(libc::STDIN_FILENO)) }
-        .to_str()
-        .unwrap();
-    if dev_name.len() <= 8 || !matches!(&dev_name[5..9], "tty" | "pty") {
-        panic!("Unsupported terminal");
-    }
-    let tty = &dev_name[5..];
-
-    utmpx.ut_type = libc::USER_PROCESS;
-    utmpx.ut_pid = pid;
-
-    for i in 0..(tty.len() - 3) {
-        utmpx.ut_id[0] = tty.as_bytes()[3 + i] as i8;
-    }
-    for i in 0..tty.len() {
-        utmpx.ut_line[i] = tty.as_bytes()[i] as i8;
-    }
-
-    todo!()
 }

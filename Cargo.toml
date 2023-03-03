@@ -9,8 +9,13 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1.0"
-dialoguer = "0.7"
+dialoguer = "0.10"
 libc = "0.2"
 signal-hook = "0.3"
 walkdir = "2.3"
-x11 = { version = "2.18", features = ["xlib"] }
+x11 = { version = "2.21", features = ["xlib"] }
+zeroize = { version = "1.5", features = ["std"] }
+
+[profile.release]
+lto = true
+codegen-units = 1

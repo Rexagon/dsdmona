@@ -71,7 +71,7 @@ pub fn set_last_session(usr: &User, desktop: &Desktop) -> Result<()> {
 
     let path = usr.home_dir().join(LAST_SESSION_PATH);
     std::fs::create_dir_all(&path)?;
-    std::fs::write(&path, format!("{};{}\n", desktop.exec, desktop.env));
+    std::fs::write(&path, format!("{};{}\n", desktop.exec, desktop.env))?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o744))?;
 
     user::set_fs_user(&previous_user);
@@ -124,7 +124,7 @@ impl Environment {
 
                     if line.starts_with('#') {
                         continue;
-                    } else if line.starts_with("[") {
+                    } else if line.starts_with('[') {
                         desktop_entry_description = line == "[Desktop Entry]";
                     } else if desktop_entry_description {
                         if let Some(split) = line.find('=') {

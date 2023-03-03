@@ -1,15 +1,8 @@
-mod auth;
-mod config;
-mod desktop;
-mod user;
-mod xlib;
-
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -17,6 +10,7 @@ use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Password, Select};
 use signal_hook::consts::signal::*;
 use signal_hook::iterator::Signals;
+use zeroize::Zeroizing;
 
 pub use self::config::{Config, LaunchType};
 use self::desktop::Desktop;
@@ -24,55 +18,20 @@ use self::user::User;
 use self::xlib::XDisplay;
 use crate::desktop::Environment;
 
+mod auth;
+mod config;
+mod desktop;
+mod user;
+mod xlib;
+
 pub fn login(config: Config) -> Result<()> {
     let user = select_user(&config)?;
     let desktop = select_desktop(&user, &config)?;
-    let env = define_env(&user, &desktop)?;
+    let env = Env::define(&user, &desktop)?;
 
     xorg(user, desktop, env, config)?;
 
     Ok(())
-}
-
-struct Env {
-    runtime_dir: String,
-    variables: HashMap<&'static str, OsString>,
-}
-
-fn define_env(user: &User, desktop: &Desktop) -> Result<Env> {
-    let runtime_dir = format!("/run/user/{}", user.uid());
-
-    let mut env: HashMap<&'static str, OsString> = HashMap::new();
-
-    env.insert("HOME", user.home_dir().into());
-    env.insert("PWD", user.home_dir().into());
-    env.insert("USER", user.name().into());
-    env.insert("LOGNAME", user.name().into());
-    env.insert("XDG_CONFIG_HOME", user.home_dir().join(".config").into());
-    env.insert("XDG_RUNTIME_DIR", runtime_dir.clone().into());
-    env.insert("XDG_SEAT", "seat0".into());
-    env.insert("XDG_SESSION_CLASS", "user".into());
-    env.insert("SHELL", user.shell().into());
-    env.insert("LANG", "en_US.UTF-8".into());
-    env.insert("PATH", std::env::var("PATH")?.into());
-
-    env.insert("DESKTOP_SESSION", desktop.name.clone().into());
-    env.insert("XDG_SESSION_DESKTOP", desktop.name.clone().into());
-
-    {
-        let runtime_dir = std::path::Path::new(&runtime_dir);
-        if !runtime_dir.exists() {
-            std::fs::create_dir_all(&runtime_dir)?;
-            user::set_file_owner(&runtime_dir, user)?;
-        }
-    }
-
-    std::env::set_current_dir(user.home_dir());
-
-    Ok(Env {
-        runtime_dir,
-        variables: env,
-    })
 }
 
 pub fn select_user(_config: &Config) -> Result<User> {
@@ -89,7 +48,10 @@ pub fn select_user(_config: &Config) -> Result<User> {
     let user = selection.default(0).with_prompt("Select user:").interact()?;
 
     loop {
-        let password = Password::with_theme(&theme).with_prompt("Enter password:").interact()?;
+        let password = Password::with_theme(&theme)
+            .with_prompt("Enter password:")
+            .interact()
+            .map(Zeroizing::new)?;
 
         if auth::auth_password(users[user].name(), &password) {
             break Ok(users[user].clone());
@@ -127,6 +89,49 @@ pub fn select_desktop(user: &User, config: &Config) -> Result<Desktop> {
     Ok(desktops[selection].clone())
 }
 
+struct Env {
+    runtime_dir: String,
+    variables: HashMap<&'static str, OsString>,
+}
+
+impl Env {
+    fn define(user: &User, desktop: &Desktop) -> Result<Self> {
+        let runtime_dir = format!("/run/user/{}", user.uid());
+
+        let mut env: HashMap<&'static str, OsString> = HashMap::new();
+
+        env.insert("HOME", user.home_dir().into());
+        env.insert("PWD", user.home_dir().into());
+        env.insert("USER", user.name().into());
+        env.insert("LOGNAME", user.name().into());
+        env.insert("XDG_CONFIG_HOME", user.home_dir().join(".config").into());
+        env.insert("XDG_RUNTIME_DIR", runtime_dir.clone().into());
+        env.insert("XDG_SEAT", "seat0".into());
+        env.insert("XDG_SESSION_CLASS", "user".into());
+        env.insert("SHELL", user.shell().into());
+        env.insert("LANG", "en_US.UTF-8".into());
+        env.insert("PATH", std::env::var("PATH")?.into());
+
+        env.insert("DESKTOP_SESSION", desktop.name.clone().into());
+        env.insert("XDG_SESSION_DESKTOP", desktop.name.clone().into());
+
+        {
+            let runtime_dir = std::path::Path::new(&runtime_dir);
+            if !runtime_dir.exists() {
+                std::fs::create_dir_all(runtime_dir)?;
+                user::set_file_owner(runtime_dir, user)?;
+            }
+        }
+
+        std::env::set_current_dir(user.home_dir())?;
+
+        Ok(Self {
+            runtime_dir,
+            variables: env,
+        })
+    }
+}
+
 fn update_last_session(user: &User, last_desktop: Option<&Desktop>, desktop: &Desktop) {
     let last_session_changed = match last_desktop {
         Some(last_desktop) => last_desktop.exec != desktop.exec || last_desktop.env != desktop.env,
@@ -142,7 +147,7 @@ fn update_last_session(user: &User, last_desktop: Option<&Desktop>, desktop: &De
 fn xorg(user: User, desktop: Desktop, mut env: Env, config: Config) -> Result<()> {
     let free_display = get_free_xdisplay().ok_or_else(|| anyhow!("There is no free xdisplay"))?;
 
-    let xauthority = Path::new(&env.runtime_dir).join(".dsdmona-xauth");
+    let xauthority = Path::new(&env.runtime_dir).join(".Xauthority");
     let display = format!(":{}", free_display);
 
     env.variables.insert("XDG_SESSION_TYPE", "x11".into());
@@ -157,7 +162,7 @@ fn xorg(user: User, desktop: Desktop, mut env: Env, config: Config) -> Result<()
 
     // Generate mcookie
     let output = exec_cmd("/usr/bin/mcookie", &user, &env).output()?;
-    let mcookie = String::from_utf8(output.stdout.clone())?;
+    let mcookie = String::from_utf8(output.stdout)?;
 
     // Generate xauth
     let _output = exec_cmd("/usr/bin/xauth", &user, &env)
@@ -168,7 +173,7 @@ fn xorg(user: User, desktop: Desktop, mut env: Env, config: Config) -> Result<()
         .output()?;
 
     // Start XOrg
-    let mut xorg = Command::new("/usr/bin/Xorg")
+    let xorg = Command::new("/usr/bin/Xorg")
         .arg(format!("vt{}", config.tty))
         .arg(&display)
         .envs(std::env::vars())
@@ -186,7 +191,7 @@ fn xorg(user: User, desktop: Desktop, mut env: Env, config: Config) -> Result<()
 
         Ok((display, xinit))
     };
-    let (_xdisplay, mut xinit) = match start_xinit() {
+    let (_xdisplay, xinit) = match start_xinit() {
         Ok(r) => r,
         Err(e) => {
             kill_process(xorg.id());
@@ -195,7 +200,7 @@ fn xorg(user: User, desktop: Desktop, mut env: Env, config: Config) -> Result<()
         }
     };
 
-    let mut signals = Signals::new(&[SIGHUP, SIGINT, SIGQUIT, SIGTERM]).unwrap();
+    let mut signals = Signals::new([SIGHUP, SIGINT, SIGQUIT, SIGTERM]).unwrap();
     let signals_handle = signals.handle();
     std::thread::spawn({
         let xinit_id = xinit.id();
@@ -225,17 +230,13 @@ fn xorg(user: User, desktop: Desktop, mut env: Env, config: Config) -> Result<()
     println!("XOrg finished");
 
     // Remove auth
-    std::fs::remove_file(&xauthority);
+    std::fs::remove_file(&xauthority)?;
 
     Ok(())
 }
 
 fn prepare_gui_command(user: &User, desktop: &Desktop, env: &Env, config: &Config) -> Result<Command> {
-    let mut exec = desktop
-        .exec
-        .split(' ')
-        .map(|item| OsString::from(item))
-        .collect::<Vec<_>>();
+    let exec = desktop.exec.split(' ').map(OsString::from).collect::<Vec<_>>();
 
     let exec: Vec<OsString> = if desktop.env == Environment::Xorg
         && config.launch_type == LaunchType::XInitRc
