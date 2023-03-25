@@ -1,7 +1,8 @@
 use std::ffi::CString;
+use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use x11::xlib;
 
 pub struct XDisplay {
@@ -9,8 +10,18 @@ pub struct XDisplay {
 }
 
 impl XDisplay {
-    pub fn open(name: String) -> Result<Self> {
-        let display_name = CString::new(name)?;
+    pub fn find_free_xdisplay() -> Option<u8> {
+        for i in 0..32 {
+            let lock = format!("/tmp/.X{}-lock", i);
+            if !Path::new(&lock).exists() {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    pub fn open(display_name: &str) -> Result<Self> {
+        let display_name = CString::new(display_name)?;
 
         for _ in 0..50 {
             let display = unsafe { xlib::XOpenDisplay(display_name.as_ptr()) };
@@ -21,7 +32,7 @@ impl XDisplay {
             }
         }
 
-        Err(anyhow!("Failed to open X Display"))
+        anyhow::bail!("Failed to open X Display")
     }
 }
 

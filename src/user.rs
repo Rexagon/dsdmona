@@ -3,7 +3,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use libc::passwd as c_passwd;
 use libc::spwd as c_spwd;
 use libc::{c_char, gid_t, uid_t};
@@ -22,6 +22,36 @@ pub struct User {
 }
 
 impl User {
+    pub fn current() -> Self {
+        unsafe { Self::new(libc::getuid()).unwrap() }
+    }
+
+    pub fn all() -> Vec<Self> {
+        let iter = unsafe { AllUsers::new() };
+        iter.filter(|user| user.uid >= MIN_UID && user.uid < MAX_UID).collect()
+    }
+
+    pub fn new(uid: uid_t) -> Result<Self> {
+        let mut passwd = unsafe { std::mem::zeroed::<c_passwd>() };
+        let mut buf = vec![0; 2048];
+        let mut result = std::ptr::null_mut::<c_passwd>();
+
+        loop {
+            let r = unsafe { libc::getpwuid_r(uid, &mut passwd, buf.as_mut_ptr(), buf.len(), &mut result) };
+
+            if r != libc::ERANGE {
+                break;
+            }
+
+            let newsize = buf.len() * 2;
+            buf.resize(newsize, 0);
+        }
+
+        anyhow::ensure!(result == &mut passwd, "User not found");
+
+        Ok(unsafe { cpasswd_to_user(result.read()) })
+    }
+
     pub fn uid(&self) -> uid_t {
         self.uid
     }
@@ -41,126 +71,91 @@ impl User {
     pub fn shell(&self) -> &Path {
         Path::new(&self.shell)
     }
-}
 
-pub fn get_current() -> User {
-    unsafe { get_user_by_uid(libc::getuid()).unwrap() }
-}
+    pub fn use_for_fs<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        unsafe fn set_fs_user(uid: uid_t, group: gid_t) {
+            libc::setfsuid(uid);
+            libc::setgid(group);
+        }
 
-pub fn set_fs_user(user: &User) {
-    unsafe {
-        libc::setfsuid(user.uid);
-        libc::setgid(user.primary_group);
-    };
-}
+        unsafe {
+            // Get current user group
+            let current_user = libc::getpwuid(libc::getuid());
+            assert!(!current_user.is_null());
+            let current_uid = (*current_user).pw_uid;
+            let current_group = (*current_user).pw_gid;
 
-pub fn set_file_owner<T>(path: T, user: &User) -> Result<()>
-where
-    T: AsRef<Path>,
-{
-    let path = CString::new(path.as_ref().as_os_str().as_bytes())?;
-    let r = unsafe { libc::chown(path.as_ptr(), user.uid, user.primary_group) };
-    if r != 0 {
-        Err(anyhow!("Failed to chown file (errno: {})", r))
-    } else {
+            // Set user as fs owner
+            set_fs_user(self.uid, self.primary_group);
+            let res = f();
+            set_fs_user(current_uid, current_group);
+
+            // Done
+            res
+        }
+    }
+
+    pub fn set_file_owner<T: AsRef<Path>>(&self, path: T) -> Result<()> {
+        let path = CString::new(path.as_ref().as_os_str().as_bytes())?;
+        let r = unsafe { libc::chown(path.as_ptr(), self.uid, self.primary_group) };
+        anyhow::ensure!(r == 0, "Failed to chown file (errno: {})", r);
+
         Ok(())
     }
-}
 
-unsafe fn from_raw_buf<'a, T>(p: *const c_char) -> T
-where
-    T: From<&'a OsStr>,
-{
-    T::from(OsStr::from_bytes(CStr::from_ptr(p).to_bytes()))
-}
-
-unsafe fn cpasswd_to_user(passwd: c_passwd) -> User {
-    let name = from_raw_buf(passwd.pw_name);
-    let home_dir = from_raw_buf::<OsString>(passwd.pw_dir).into();
-    let shell = from_raw_buf::<OsString>(passwd.pw_shell).into();
-    User {
-        uid: passwd.pw_uid,
-        primary_group: passwd.pw_gid,
-        name,
-        home_dir,
-        shell,
-    }
-}
-
-pub fn get_user_by_uid(uid: uid_t) -> Option<User> {
-    let mut passwd = unsafe { std::mem::zeroed::<c_passwd>() };
-    let mut buf = vec![0; 2048];
-    let mut result = std::ptr::null_mut::<c_passwd>();
-
-    loop {
-        let r = unsafe { libc::getpwuid_r(uid, &mut passwd, buf.as_mut_ptr(), buf.len(), &mut result) };
-
-        if r != libc::ERANGE {
-            break;
+    pub fn check_password(&self, password: &str) -> Result<bool> {
+        #[link(name = "crypt")]
+        extern "C" {
+            fn crypt(key: *const c_char, salt: *const c_char) -> *mut c_char;
         }
 
-        let newsize = buf.len().checked_mul(2)?;
-        buf.resize(newsize, 0);
+        let password: Zeroizing<_> = CString::new(password).map(Zeroizing::new).unwrap();
+        let user_password: Zeroizing<_> = self.get_password()?;
+
+        Ok(unsafe {
+            let result = crypt(password.as_ptr(), user_password.as_ptr());
+            !result.is_null() && user_password.as_ref() == CStr::from_ptr(result)
+        })
     }
 
-    if result.is_null() {
-        return None;
-    }
+    pub fn get_password(&self) -> Result<Zeroizing<CString>> {
+        let name = CString::new(self.name.as_bytes())?;
 
-    if result != &mut passwd {
-        return None;
-    }
+        let mut spwd = unsafe { std::mem::zeroed::<c_spwd>() };
+        let mut buf = Zeroizing::new(vec![0; 2048]);
+        let mut result = std::ptr::null_mut::<c_spwd>();
 
-    let user = unsafe { cpasswd_to_user(result.read()) };
-    Some(user)
-}
+        loop {
+            let r = unsafe { libc::getspnam_r(name.as_ptr(), &mut spwd, buf.as_mut_ptr(), buf.len(), &mut result) };
 
-pub fn get_user_password<T>(username: &T) -> Result<Zeroizing<CString>>
-where
-    T: AsRef<OsStr> + ?Sized,
-{
-    let username = CString::new(username.as_ref().as_bytes())?;
-
-    let mut spwd = unsafe { std::mem::zeroed::<c_spwd>() };
-    let mut buf = Zeroizing::new(vec![0; 2048]);
-    let mut result = std::ptr::null_mut::<c_spwd>();
-
-    loop {
-        let r = unsafe { libc::getspnam_r(username.as_ptr(), &mut spwd, buf.as_mut_ptr(), buf.len(), &mut result) };
-
-        match r {
-            libc::EACCES => {
-                return Err(anyhow!(
-                    "The caller does not have permission to access the shadow password file"
-                ))
+            match r {
+                libc::EACCES => {
+                    anyhow::bail!("The caller does not have permission to access the shadow password file")
+                }
+                libc::ERANGE => {
+                    let newsize = buf
+                        .len()
+                        .checked_mul(2)
+                        .ok_or_else(|| anyhow::Error::msg("Failed to increase spwd buffer"))?;
+                    buf.resize(newsize, 0);
+                }
+                _ => break,
             }
-            libc::ERANGE => {
-                let newsize = buf
-                    .len()
-                    .checked_mul(2)
-                    .ok_or_else(|| anyhow!("Failed to increase spwd buffer"))?;
-                buf.resize(newsize, 0);
-            }
-            _ => break,
         }
+
+        anyhow::ensure!(
+            result == &mut spwd,
+            "Failed to find a shadow file record for the specified username"
+        );
+
+        let bytes = unsafe { CStr::from_ptr(spwd.sp_pwdp).to_bytes() };
+        let result = Zeroizing::new(CString::new(bytes)?);
+
+        Ok(result)
     }
-
-    if result.is_null() || result != &mut spwd {
-        return Err(anyhow!("Failed to find shadow file record for specified username"));
-    }
-
-    let bytes = unsafe { CStr::from_ptr(spwd.sp_pwdp).to_bytes() };
-    let result = Zeroizing::new(CString::new(bytes)?);
-
-    Ok(result)
-}
-
-pub unsafe fn all_users() -> impl Iterator<Item = User> {
-    AllUsers::new()
-}
-
-pub unsafe fn all_human_users() -> impl Iterator<Item = User> {
-    all_users().filter(|user| user.uid >= MIN_UID && user.uid < MAX_UID)
 }
 
 struct AllUsers;
@@ -189,5 +184,25 @@ impl Iterator for AllUsers {
             let user = unsafe { cpasswd_to_user(result.read()) };
             Some(user)
         }
+    }
+}
+
+unsafe fn cpasswd_to_user(passwd: c_passwd) -> User {
+    unsafe fn from_raw_buf<'a, T>(p: *const c_char) -> T
+    where
+        T: From<&'a OsStr>,
+    {
+        T::from(OsStr::from_bytes(CStr::from_ptr(p).to_bytes()))
+    }
+
+    let name = from_raw_buf(passwd.pw_name);
+    let home_dir = from_raw_buf::<OsString>(passwd.pw_dir).into();
+    let shell = from_raw_buf::<OsString>(passwd.pw_shell).into();
+    User {
+        uid: passwd.pw_uid,
+        primary_group: passwd.pw_gid,
+        name,
+        home_dir,
+        shell,
     }
 }

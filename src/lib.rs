@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::{Child, Command};
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Password, Select};
 use signal_hook::consts::signal::*;
@@ -15,14 +15,12 @@ use zeroize::Zeroizing;
 pub use self::config::{Config, LaunchType};
 use self::desktop::Desktop;
 use self::user::User;
-use self::xlib::XDisplay;
-use crate::desktop::Environment;
+use self::xdisplay::XDisplay;
 
-mod auth;
 mod config;
 mod desktop;
 mod user;
-mod xlib;
+mod xdisplay;
 
 pub fn login(config: Config) -> Result<()> {
     let user = select_user(&config)?;
@@ -35,17 +33,17 @@ pub fn login(config: Config) -> Result<()> {
 }
 
 pub fn select_user(_config: &Config) -> Result<User> {
-    let users = unsafe { user::all_human_users() }.collect::<Vec<_>>();
-    if users.is_empty() {
-        return Err(anyhow!("No users found"));
-    }
+    let users = User::all();
+    anyhow::ensure!(!users.is_empty(), "No users found");
 
     let theme = ColorfulTheme::default();
     let mut selection = Select::with_theme(&theme);
     for user in &users {
         selection.item(user.name().to_string_lossy());
     }
+
     let user = selection.default(0).with_prompt("Select user:").interact()?;
+    let user = users[user].clone();
 
     loop {
         let password = Password::with_theme(&theme)
@@ -53,8 +51,8 @@ pub fn select_user(_config: &Config) -> Result<User> {
             .interact()
             .map(Zeroizing::new)?;
 
-        if auth::auth_password(users[user].name(), &password) {
-            break Ok(users[user].clone());
+        if user.check_password(&password)? {
+            break Ok(user);
         } else {
             println!("Invalid password!");
         }
@@ -62,12 +60,10 @@ pub fn select_user(_config: &Config) -> Result<User> {
 }
 
 pub fn select_desktop(user: &User, config: &Config) -> Result<Desktop> {
-    let desktops = desktop::all_desktops();
-    if desktops.is_empty() {
-        return Err(anyhow!("No desktops found"));
-    }
+    let desktops = Desktop::all();
+    anyhow::ensure!(!desktops.is_empty(), "No desktops found");
 
-    let last_desktop = desktop::get_last_desktop(user, &desktops);
+    let last_desktop = user.get_last_desktop(&desktops);
     if let Some(auto_login_session) = &config.auto_login_session {
         let auto_login_session = auto_login_session.trim();
         if let Some(desktop) = desktops
@@ -115,12 +111,9 @@ impl Env {
         env.insert("DESKTOP_SESSION", desktop.name.clone().into());
         env.insert("XDG_SESSION_DESKTOP", desktop.name.clone().into());
 
-        {
-            let runtime_dir = std::path::Path::new(&runtime_dir);
-            if !runtime_dir.exists() {
-                std::fs::create_dir_all(runtime_dir)?;
-                user::set_file_owner(runtime_dir, user)?;
-            }
+        if !Path::new(&runtime_dir).exists() {
+            std::fs::create_dir_all(&runtime_dir)?;
+            user.set_file_owner(&runtime_dir)?;
         }
 
         std::env::set_current_dir(user.home_dir())?;
@@ -134,21 +127,24 @@ impl Env {
 
 fn update_last_session(user: &User, last_desktop: Option<&Desktop>, desktop: &Desktop) {
     let last_session_changed = match last_desktop {
-        Some(last_desktop) => last_desktop.exec != desktop.exec || last_desktop.env != desktop.env,
+        Some(last_desktop) => last_desktop.exec != desktop.exec,
         None => true,
     };
+
     if last_session_changed {
-        if let Err(e) = desktop::set_last_session(user, desktop) {
+        if let Err(e) = user.set_last_session(desktop) {
             eprintln!("Failed to set last session: {}", e);
         }
     }
 }
 
 fn xorg(user: User, desktop: Desktop, mut env: Env, config: Config) -> Result<()> {
-    let free_display = get_free_xdisplay().ok_or_else(|| anyhow!("There is no free xdisplay"))?;
+    let Some(free_display) = XDisplay::find_free_xdisplay() else {
+        anyhow::bail!("There is no free xdisplay");
+    };
 
     let xauthority = Path::new(&env.runtime_dir).join(".Xauthority");
-    let display = format!(":{}", free_display);
+    let display = format!(":{free_display}");
 
     env.variables.insert("XDG_SESSION_TYPE", "x11".into());
     env.variables.insert("XAUTHORITY", xauthority.as_os_str().to_owned());
@@ -158,7 +154,7 @@ fn xorg(user: User, desktop: Desktop, mut env: Env, config: Config) -> Result<()
     std::env::set_var("DISPLAY", &display);
 
     std::fs::write(&xauthority, "")?;
-    user::set_file_owner(&xauthority, &user)?;
+    user.set_file_owner(&xauthority)?;
 
     // Generate mcookie
     let output = exec_cmd("/usr/bin/mcookie", &user, &env).output()?;
@@ -181,7 +177,7 @@ fn xorg(user: User, desktop: Desktop, mut env: Env, config: Config) -> Result<()
     println!("Started Xorg");
 
     let start_xinit = || -> Result<(XDisplay, Child)> {
-        let display = XDisplay::open(display)?;
+        let display = XDisplay::open(&display)?;
 
         // Start xinit
         let xinit = prepare_gui_command(&user, &desktop, &env, &config)?
@@ -238,31 +234,26 @@ fn xorg(user: User, desktop: Desktop, mut env: Env, config: Config) -> Result<()
 fn prepare_gui_command(user: &User, desktop: &Desktop, env: &Env, config: &Config) -> Result<Command> {
     let exec = desktop.exec.split(' ').map(OsString::from).collect::<Vec<_>>();
 
-    let exec: Vec<OsString> = if desktop.env == Environment::Xorg
-        && config.launch_type == LaunchType::XInitRc
+    let (bin, args): (OsString, Vec<OsString>) = if config.launch_type == LaunchType::XInitRc
         && !exec.contains(&OsString::from(".xinitrc"))
         && user.home_dir().join(".xinitrc").exists()
     {
-        let mut result = vec!["/bin/sh".into(), user.home_dir().join(".xinitrc").into_os_string()];
-        result.extend(exec.into_iter());
-        result
+        let bin = "/bin/bash".into();
+        let mut args = vec!["--login".into(), user.home_dir().join(".xinitrc").into_os_string()];
+        args.extend(exec.into_iter());
+        (bin, args)
     } else if config.launch_type == LaunchType::DBus {
-        let mut result = vec!["dbus-launch".into()];
-        result.extend(exec.into_iter());
-        result
+        ("dbus-launch".into(), exec)
     } else {
-        exec
+        let Some((bin, args)) = exec.split_first() else {
+            anyhow::bail!("Empty exec");
+        };
+        (bin.to_owned(), args.to_vec())
     };
 
-    if exec.is_empty() {
-        Err(anyhow!("Invalid exec command"))
-    } else {
-        let mut command = exec_cmd(&exec[0], user, env);
-        for arg in exec {
-            command.arg(arg);
-        }
-        Ok(command)
-    }
+    let mut command = exec_cmd(bin, user, env);
+    command.args(args);
+    Ok(command)
 }
 
 fn exec_cmd<T>(path: T, user: &User, env: &Env) -> Command
@@ -286,14 +277,4 @@ fn wait_process(mut child: Child) {
     if let Err(e) = child.wait() {
         eprintln!("Failed to wait child process: {}", e);
     }
-}
-
-fn get_free_xdisplay() -> Option<u32> {
-    for i in 0..32 {
-        let lock = format!("/tmp/.X{}-lock", i);
-        if !Path::new(&lock).exists() {
-            return Some(i);
-        }
-    }
-    None
 }
