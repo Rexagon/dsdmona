@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub tty: u8,
@@ -9,4 +11,16 @@ pub struct Config {
 pub enum LaunchType {
     XInitRc,
     DBus,
+}
+
+impl FromStr for LaunchType {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "xinitrc" => Ok(Self::XInitRc),
+            "dbus" => Ok(Self::DBus),
+            _ => anyhow::bail!("Unknown launch type"),
+        }
+    }
 }

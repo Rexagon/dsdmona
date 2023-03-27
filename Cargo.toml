@@ -9,6 +9,7 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1.0"
+argh = "0.1"
 dialoguer = "0.10"
 libc = "0.2"
 signal-hook = "0.3"

@@ -6,7 +6,8 @@ use std::process::{Child, Command};
 use std::time::Duration;
 
 use anyhow::Result;
-use dialoguer::theme::ColorfulTheme;
+use dialoguer::console::Term;
+use dialoguer::theme::Theme;
 use dialoguer::{Password, Select};
 use signal_hook::consts::signal::*;
 use signal_hook::iterator::Signals;
@@ -23,8 +24,11 @@ mod user;
 mod xdisplay;
 
 pub fn login(config: Config) -> Result<()> {
-    let user = select_user(&config)?;
-    let desktop = select_desktop(&user, &config)?;
+    let theme = dialoguer::theme::ColorfulTheme::default();
+    let term = Term::stdout();
+
+    let user = select_user(&theme, &term, &config)?;
+    let desktop = select_desktop(&theme, &term, &user, &config)?;
     let env = Env::define(&user, &desktop)?;
 
     xorg(user, desktop, env, config)?;
@@ -32,23 +36,22 @@ pub fn login(config: Config) -> Result<()> {
     Ok(())
 }
 
-pub fn select_user(_config: &Config) -> Result<User> {
+pub fn select_user(theme: &dyn Theme, term: &Term, _config: &Config) -> Result<User> {
     let users = User::all();
     anyhow::ensure!(!users.is_empty(), "No users found");
 
-    let theme = ColorfulTheme::default();
-    let mut selection = Select::with_theme(&theme);
+    let mut selection = Select::with_theme(theme);
     for user in &users {
         selection.item(user.name().to_string_lossy());
     }
 
-    let user = selection.default(0).with_prompt("Select user:").interact()?;
+    let user = selection.default(0).with_prompt("Select user:").interact_on(term)?;
     let user = users[user].clone();
 
     loop {
-        let password = Password::with_theme(&theme)
+        let password = Password::with_theme(theme)
             .with_prompt("Enter password:")
-            .interact()
+            .interact_on(term)
             .map(Zeroizing::new)?;
 
         if user.check_password(&password)? {
@@ -59,7 +62,7 @@ pub fn select_user(_config: &Config) -> Result<User> {
     }
 }
 
-pub fn select_desktop(user: &User, config: &Config) -> Result<Desktop> {
+pub fn select_desktop(theme: &dyn Theme, term: &Term, user: &User, config: &Config) -> Result<Desktop> {
     let desktops = Desktop::all();
     anyhow::ensure!(!desktops.is_empty(), "No desktops found");
 
@@ -75,13 +78,12 @@ pub fn select_desktop(user: &User, config: &Config) -> Result<Desktop> {
         };
     }
 
-    let theme = ColorfulTheme::default();
-    let mut selection = Select::with_theme(&theme);
+    let mut selection = Select::with_theme(theme);
     for desktop in &desktops {
         selection.item(&desktop.name);
     }
 
-    let selection = selection.default(0).with_prompt("Select desktop:").interact()?;
+    let selection = selection.default(0).with_prompt("Select desktop:").interact_on(term)?;
     Ok(desktops[selection].clone())
 }
 
